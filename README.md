@@ -4,11 +4,11 @@ A mobile-first, English-language 2D posture observation prototype. React and Med
 
 This educational prototype does not diagnose or rule out scoliosis, measure Cobb angle, reconstruct the spine, or recommend treatment.
 
-## Start on this Mac
+中文协作与安装说明：[团队上手指南](docs/TEAM_GUIDE.md) · [贡献流程](CONTRIBUTING.md)
 
-Dependencies and model assets have been installed in this checkout.
+## Run locally
 
-Double-click **Start SpineSight.command**, or run from the project directory:
+For a first checkout, complete the setup below. Then run from the project directory:
 
 ```sh
 python3 scripts/dev.py
@@ -16,11 +16,15 @@ python3 scripts/dev.py
 
 Open **http://localhost:5173**. Keep the terminal running; Ctrl+C stops both servers. If port 5173 or 8000 is already in use, use the existing app or stop its terminal first.
 
-The DeepSeek key belongs in `backend/.env` only. It is ignored by Git and is never bundled into the frontend. Restart the backend after changing this file.
+On macOS, after setup, you can also double-click **Start SpineSight.command**.
+
+The optional DeepSeek key belongs in `backend/.env` only. Each teammate supplies their own local key; it is ignored by Git and is never bundled into the frontend. Geometric analysis works without a key. Restart the backend after changing this file.
 
 ## Set up a fresh checkout
 
 Requirements: Python 3.11, Node.js 22.12+ (or a compatible supported LTS), npm, and an internet connection for dependency/model downloads.
+
+Clone this public repository using its GitHub **Code** button, then open a terminal in the cloned project directory. Anyone can clone and run it or contribute through a fork and pull request. Pushing branches directly to this repository requires collaborator write access.
 
 ```sh
 python3.11 scripts/setup.py
@@ -34,9 +38,9 @@ py -3.11 scripts/setup.py
 py -3.11 scripts/dev.py
 ```
 
-Setup creates `backend/.venv`, installs the locked Python and npm dependencies, copies the frontend WASM assets, verifies both model copies, and creates missing `.env` files without overwriting existing ones. Python dependencies are pinned in `backend/requirements.lock.txt`; npm uses `frontend/package-lock.json`.
+Setup creates `backend/.venv`, installs the locked Python and npm dependencies, copies the frontend WASM assets, verifies both model copies, and creates `backend/.env` from the root `.env.example` if missing. Existing configuration is preserved. The frontend uses a same-origin API proxy and needs no `.env` file. Python dependencies are pinned in `backend/requirements.lock.txt`; npm uses `frontend/package-lock.json`.
 
-Backend settings are documented in `backend/.env.example`:
+Backend settings are documented in the root [`.env.example`](.env.example):
 
 ```dotenv
 DEEPSEEK_API_KEY=
@@ -57,7 +61,7 @@ The phone's browser needs a trusted HTTPS origin. A plain computer LAN IP over H
    npm run build
    cd ..
    ```
-3. Ensure `cloudflared` is installed (`brew install cloudflared` on macOS; already installed on this Mac).
+3. Install `cloudflared` if needed (`brew install cloudflared` on macOS with Homebrew; see [Cloudflare downloads](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/) for other platforms).
 4. Run:
    ```sh
    python3 scripts/phone.py
@@ -69,7 +73,7 @@ The phone helper serves the built frontend and proxies `/api` through a password
 
 Topology: phone → HTTPS tunnel → password gate/built frontend → local FastAPI.
 
-The installed cloudflared version does not support the newer `--allowed-mail` flag, so the helper uses its own password gate. See [Cloudflare Quick Tunnels](https://developers.cloudflare.com/tunnel/get-started/quick-tunnels/).
+The helper uses its own password gate and does not rely on a cloudflared `--allowed-mail` flag. See [Cloudflare Quick Tunnels](https://developers.cloudflare.com/tunnel/get-started/quick-tunnels/).
 
 ## Features
 

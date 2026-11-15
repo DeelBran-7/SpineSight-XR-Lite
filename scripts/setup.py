@@ -28,13 +28,13 @@ def main() -> None:
     run([str(python), "-m", "pip", "install", "-r", "requirements.lock.txt"], ROOT / "backend")
     run([npm, "ci"], ROOT / "frontend")
     run([str(python), str(ROOT / "scripts/download_model.py")])
-    for folder in (ROOT / "backend", ROOT / "frontend"):
-        example, target = folder / ".env.example", folder / ".env"
-        if example.exists() and not target.exists():
-            shutil.copyfile(example, target)
-            if os.name != "nt":
-                target.chmod(0o600)
-    print("\nSetup complete. Add your DeepSeek key to backend/.env, then run: python3 scripts/dev.py")
+    target = ROOT / "backend/.env"
+    if not target.exists():
+        shutil.copyfile(ROOT / ".env.example", target)
+        if os.name != "nt":
+            target.chmod(0o600)
+    print("\nSetup complete. Run: python3 scripts/dev.py")
+    print("Optional AI reports/chat: add your DeepSeek key to backend/.env, then restart the server.")
 
 
 if __name__ == "__main__":
