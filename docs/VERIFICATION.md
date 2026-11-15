@@ -2,7 +2,34 @@
 
 Test environment: macOS ARM64, Python 3.11.9, Node.js 22.22.3. This records actual checks, not a claim of clinical validation.
 
-## Passed
+## Optimization verification
+
+The Astra ultra optimization pass completed **153 tests**: 83 backend, 58
+frontend, eight phone gateway, and four development launcher tests. Frontend
+TypeScript and production build succeeded. Backend tests disable `.env` reads
+and block real HTTP transport before importing the application; this pass made
+**zero paid AI calls**.
+
+Actual browser QA used a clearly labelled temporary test-image camera with the
+real MediaPipe worker and application UI. About 357 frames were processed.
+Freezing video stopped capture readiness; resuming restored it. The default
+ten-second countdown, immediate capture, retake, and track release passed.
+Backend analysis of the captured image also succeeded, with no browser warning
+or error logs in that flow. The temporary test files were removed before the
+final build. The final UI was also checked at 320 pixels (Home, Results,
+Assistant: no horizontal overflow), Enter added a line without sending a
+question, Home resumed the current result, and refresh cleared the session.
+A clean startup through the development launcher succeeded after a real
+TIME_WAIT restart issue was fixed.
+
+Focused regressions cover stale/late frames, worker timeouts, hidden-tab camera
+release, late permission resolution, StrictMode, session-owned AI requests,
+navigation while a request finishes, duplicate submissions, malformed API
+responses, expired-photo reuse, report retry deduplication/TTL/cancellation,
+request budgets, slow uploads, gateway origin checks, process-tree shutdown, and a real TCP TIME_WAIT restart regression.
+These deterministic checks do not substitute for a physical-phone test.
+
+## Initial implementation checks
 
 - Frontend: `npm test` — **17 passed**; `npm run typecheck` and `npm run build` both succeeded.
 - Browser model/capture: Chrome with a local sample-image canvas video stream ran real MediaPipe worker inference for 109 frames. Immediate capture and three-second countdown produced previews; retake created a fresh live stream; all previous tracks reached `ended`. This test made zero uploads/AI requests. Temporary QA pages and the sample image were removed before the final production build.

@@ -1,3 +1,5 @@
+import type { ChatMessage } from "./api";
+
 export const analysisQuestions = [
   "What does my shoulder measurement mean?",
   "How is torso lean calculated?",
@@ -13,9 +15,9 @@ export const generalQuestions = [
 export function describeLevel(direction: string) {
   switch (direction) {
     case "left_landmark_higher_in_image":
-      return "The left landmark appears higher in the photo.";
+      return "The model’s left landmark appears higher in the photo.";
     case "right_landmark_higher_in_image":
-      return "The right landmark appears higher in the photo.";
+      return "The model’s right landmark appears higher in the photo.";
     case "aligned_with_image_horizontal":
       return "The two landmarks are at the same height in the photo.";
     default:
@@ -45,4 +47,19 @@ export function formatPercent(value: number) {
 
 export function formatAngle(value: number) {
   return `${signedNumber.format(value)}°`;
+}
+export function explainOffset(value: number) {
+  return `${number.format(value)} units of height difference for every 100 units of horizontal distance between the points.`;
+}
+
+/** Only completed, adjacent question/answer pairs can be reused by the UI. */
+export function findPreviousAnswer(messages: ChatMessage[], question: string): number | null {
+  const normalize = (text: string) => text.trim().replace(/\s+/g, " ").toLocaleLowerCase("en");
+  const target = normalize(question);
+  if (!target) return null;
+  for (let index = messages.length - 2; index >= 0; index -= 1) {
+    if (messages[index].role === "user" && normalize(messages[index].content) === target
+      && messages[index + 1].role === "assistant" && messages[index + 1].content.trim()) return index + 1;
+  }
+  return null;
 }

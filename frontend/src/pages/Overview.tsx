@@ -55,7 +55,8 @@ function GeometryIllustration() {
 }
 
 export function HomePage() {
-  const { clearObservation, consented } = useSession();
+  const { clearObservation, consented, analysis, photo } = useSession();
+  const resumePath = analysis ? "/results" : photo ? "/preview" : null;
 
   return (
     <div className="home">
@@ -65,14 +66,19 @@ export function HomePage() {
           <h1>See your posture in a new way.</h1>
           <p className="hero-description">Use one back-view photo to see the visible alignment of your shoulders, hips, and torso.</p>
           <div className="hero-actions">
-            <Button asChild size="large" onClick={clearObservation}>
-              <Link to={consented ? "/instructions" : "/privacy"} state={{ next: "/instructions" }}>
-                Start observation <ArrowRight size={19} />
-              </Link>
-            </Button>
+            {resumePath ? (
+              <Button asChild size="large"><Link to={resumePath}>{analysis ? "View current results" : "Continue with your photo"} <ArrowRight size={19} /></Link></Button>
+            ) : (
+              <Button asChild size="large" onClick={clearObservation}>
+                <Link to={consented ? "/instructions" : "/privacy"} state={{ next: "/instructions" }}>
+                  Start observation <ArrowRight size={19} />
+                </Link>
+              </Button>
+            )}
             <a className="how-link" href="#how-it-works">How it works <ArrowDown size={16} /></a>
           </div>
           <div className="hero-note"><LockKeyhole size={15} /> Your live camera feed stays on this device.</div>
+          {resumePath && <div className="session-resume"><span>Your current observation stays in this tab until you refresh or start again.</span><Link to="/instructions" className="text-link" onClick={clearObservation}>Start a new observation <ArrowRight size={16} /></Link></div>}
         </div>
         <GeometryIllustration />
       </section>
@@ -92,7 +98,7 @@ export function HomePage() {
 const privacyPoints = [
   { icon: Camera, title: "Camera and photo", text: "Live camera guidance runs on your device. When you choose Analyze, the app sends one photo to the developer’s local analysis server through the configured connection. Phone access uses HTTPS. The app processes the photo in memory and does not intentionally save it." },
   { icon: Layers, title: "Measurements and AI", text: "The server returns structured measurements. DeepSeek receives those measurements for AI summaries and, when an observation is attached, for chat. It also receives the messages you send in chat. The photo stays out of requests to DeepSeek." },
-  { icon: LockKeyhole, title: "Session and personal details", text: "This tab holds consent, the photo, results, and chat in memory. The server keeps structured measurements temporarily. Keep identifying details out of chat." },
+  { icon: LockKeyhole, title: "Session and personal details", text: "This tab holds consent, your photo, results, and chat in memory; refreshing or closing it clears them. The server keeps structured measurements for up to 30 minutes and briefly reuses AI summaries for retries. A server restart clears its temporary data. Keep identifying details out of chat." },
   { icon: Info, title: "Educational use", text: "This prototype describes visible geometry in a single image. It cannot diagnose or rule out scoliosis or any other medical condition." },
 ];
 

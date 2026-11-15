@@ -84,54 +84,145 @@ function isErrorResponse(data: unknown): data is ErrorResponse {
     && "message" in error && typeof error.message === "string";
 }
 
-async function read<T>(url: string, init?: RequestInit): Promise<T> {
-  let response: Response;
-  try {
-    response = await fetch(url, { cache: "no-store", ...init });
-  } catch (error) {
-    if (init?.signal?.aborted) throw error;
-    throw new APIError("NETWORK_ERROR", "Could not reach the analysis service. Try again in a moment.");
-  }
-  const body: unknown = await response.json().catch(() => null);
-  if (isErrorResponse(body)) {
-    throw new APIError(body.error.code, body.error.message, response.status);
-  }
-  if (!response.ok || !body || typeof body !== "object") {
-    throw new APIError("SERVICE_ERROR", "The service could not complete that request. Please try again.", response.status);
-  }
-  return body as T;
+type Validator<T> = (body: unknown) => body is T;
+const object = (value: unknown): value is Record<string, unknown> => !!value && typeof value === "object" && !Array.isArray(value);
+const text = (value: unknown): value is string => typeof value === "string" && value.trim().length > 0;
+const finite = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value);
+const unit = (value: unknown) => finite(value) && value >= 0 && value <= 1;
+const positiveInteger = (value: unknown) => finite(value) && Number.isInteger(value) && value > 0;
+const FEATURES = ["shoulder", "hip", "torso"] as const;
+const MEASUREMENTS: (keyof AnalysisMeasurements)[] = ["shoulder_asymmetry_percent", "shoulder_angle_deg", "hip_asymmetry_percent", "hip_angle_deg", "torso_lean_angle_deg"];
+
+function isAnalysis(body: unknown): body is PostureAnalysisResponse {
+  if (!object(body) || body.success !== true || !text(body.analysis_id)
+    || !object(body.image) || !positiveInteger(body.image.width) || !positiveInteger(body.image.height)
+    || !object(body.quality) || body.quality.valid !== true || !text(body.quality.message) || !unit(body.quality.landmark_visibility_threshold)
+    || !object(body.landmarks) || !object(body.measurements) || !object(body.observations)) return false;
+  const { landmarks, measurements, observations } = body;
+  return Object.keys(LANDMARK_NAMES).every((key) => {
+    const point = landmarks[key];
+    return object(point) && unit(point.x) && unit(point.y) && unit(point.visibility);
+  }) && MEASUREMENTS.every((key) => finite(measurements[key]))
+    && FEATURES.every((key) => object(observations[key]) && observations[key].status === "measurement_available" && text(observations[key].direction));
 }
 
-function post<T>(endpoint: string, body: object, signal: AbortSignal) {
-  return read<T>(`/api/v1/${endpoint}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-    signal,
+function isReport(body: unknown): body is ReportResponse {
+  if (!object(body) || body.success !== true || !text(body.analysis_id) || !object(body.report)) return false;
+  const report = body.report;
+  return text(report.simple_summary) && text(report.technical_summary) && text(report.disclaimer)
+    && object(report.findings) && FEATURES.every((key) => text((report.findings as Record<string, unknown>)[key]))
+    && Array.isArray(report.limitations) && report.limitations.length > 0 && report.limitations.every(text);
+}
+
+function isAssistant(body: unknown): body is AssistantResponse {
+  return object(body) && body.success === true && (body.analysis_id === null || text(body.analysis_id)) && text(body.reply);
+}
+
+function isHealth(body: unknown): body is HealthResponse {
+  return object(body) && body.status === "ok" && text(body.service) && text(body.version)
+    && typeof body.pose_model_ready === "boolean" && typeof body.llm_configured === "boolean";
+}
+
+// A route may stop listening while a paid request continues for the current session.
+function listen<T>(promise: Promise<T>, signal?: AbortSignal | null): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(signal.reason ?? new DOMException("Aborted", "AbortError"));
+  return new Promise((resolve, reject) => {
+    const abort = () => { cleanup(); reject(signal.reason ?? new DOMException("Aborted", "AbortError")); };
+    const cleanup = () => signal.removeEventListener("abort", abort);
+    signal.addEventListener("abort", abort, { once: true });
+    promise.then((value) => { cleanup(); resolve(value); }, (error: unknown) => { cleanup(); reject(error); });
   });
+}
+
+async function read<T>(url: string, validate: Validator<T>, timeoutMs: number, init?: RequestInit): Promise<T> {
+  if (init?.signal?.aborted) throw init.signal.reason ?? new DOMException("Aborted", "AbortError");
+  const controller = new AbortController();
+  let timedOut = false;
+  const cancel = () => controller.abort(init?.signal?.reason);
+  if (init?.signal?.aborted) cancel();
+  else init?.signal?.addEventListener("abort", cancel, { once: true });
+  const timeout = setTimeout(() => { timedOut = true; controller.abort(); }, timeoutMs);
+  try {
+    const response = await listen(fetch(url, { cache: "no-store", ...init, signal: controller.signal }), controller.signal);
+    const body: unknown = await listen(response.json().catch(() => null), controller.signal);
+    if (isErrorResponse(body)) throw new APIError(body.error.code, body.error.message, response.status);
+    if (!response.ok) throw new APIError("SERVICE_ERROR", "The service could not complete that request. Please try again.", response.status);
+    if (!validate(body)) throw new APIError("INVALID_RESPONSE", "The service returned an incomplete result. Please try again.", response.status);
+    return body;
+  } catch (error) {
+    if (timedOut) throw new APIError("REQUEST_TIMEOUT", "The service took too long to respond. Please try again.");
+    if (init?.signal?.aborted || error instanceof APIError) throw error;
+    throw new APIError("NETWORK_ERROR", "Could not reach the analysis service. Try again in a moment.");
+  } finally {
+    clearTimeout(timeout);
+    init?.signal?.removeEventListener("abort", cancel);
+  }
+}
+
+interface SharedRequest {
+  controller: AbortController;
+  promise: Promise<unknown>;
+  settled: boolean;
+}
+const paidRequests = new Map<string, SharedRequest>();
+const MAX_SAVED_REQUESTS = 32;
+
+export function clearAPIRequests() {
+  for (const request of paidRequests.values()) request.controller.abort();
+  paidRequests.clear();
+}
+
+function paidPost<T>(endpoint: string, body: { analysis_id: string | null } & Record<string, unknown>, validate: Validator<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(signal.reason ?? new DOMException("Aborted", "AbortError"));
+  const key = JSON.stringify([endpoint, body]);
+  let request = paidRequests.get(key);
+  if (!request) {
+    const controller = new AbortController();
+    const pending = read<T>(`/api/v1/${endpoint}`, validate, 100_000, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal: controller.signal,
+    }).then((result) => {
+      if ((result as ReportResponse | AssistantResponse).analysis_id !== body.analysis_id) {
+        throw new APIError("INVALID_RESPONSE", "The service returned a result for a different observation. Please try again.");
+      }
+      return result;
+    });
+    request = { controller, promise: pending, settled: false };
+    paidRequests.set(key, request);
+    const entry = request;
+    // Keep successful responses so navigating away and back cannot duplicate a paid call.
+    void pending.then(() => {
+      entry.settled = true;
+      for (const [savedKey, saved] of paidRequests) {
+        if (paidRequests.size <= MAX_SAVED_REQUESTS) break;
+        if (saved.settled) paidRequests.delete(savedKey);
+      }
+    }, () => { if (paidRequests.get(key) === entry) paidRequests.delete(key); });
+  }
+  return listen(request.promise as Promise<T>, signal);
 }
 
 export const CHAT_MESSAGE_LIMIT = 1200;
 export const CHAT_HISTORY_LIMIT = 8;
 
 export const api = {
-  health: (signal?: AbortSignal) => read<HealthResponse>("/api/health", { signal }),
+  health: (signal?: AbortSignal) => read<HealthResponse>("/api/health", isHealth, 8_000, { signal }),
   analyze(file: File, signal: AbortSignal) {
     const form = new FormData();
     form.set("file", file);
-    return read<PostureAnalysisResponse>("/api/v1/analyze", { method: "POST", body: form, signal });
+    return read<PostureAnalysisResponse>("/api/v1/analyze", isAnalysis, 60_000, { method: "POST", body: form, signal });
   },
   report: (analysisId: string, signal: AbortSignal) =>
-    post<ReportResponse>("report", { analysis_id: analysisId }, signal),
+    paidPost<ReportResponse>("report", { analysis_id: analysisId }, isReport, signal),
   assistant: (analysisId: string | null, message: string, history: ChatMessage[], signal: AbortSignal) =>
-    post<AssistantResponse>("assistant", {
+    paidPost<AssistantResponse>("assistant", {
       analysis_id: analysisId,
       message,
       history: history.slice(-CHAT_HISTORY_LIMIT).map((item) => ({
         role: item.role,
         content: item.content.slice(0, CHAT_MESSAGE_LIMIT),
       })),
-    }, signal),
+    }, isAssistant, signal),
 };
 
 export function readableError(error: unknown, fallback: string) {

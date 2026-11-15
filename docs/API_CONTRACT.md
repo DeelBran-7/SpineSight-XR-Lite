@@ -1,6 +1,6 @@
 # SpineSight XR Lite --- API Contract
 
-**Version:** 1.1\
+**Version:** 1.2\
 **Backend:** FastAPI\
 **Base path:** `/api`\
 **Content type:** JSON except image upload
@@ -43,10 +43,11 @@ Recommended HTTP status mapping:
     HTTP Error / meaning
   ------ --------------------------------------------
      400 Invalid request or unsupported image
+     408 Request body upload timed out
      413 Image exceeds upload limit
      422 Valid request but unusable image/landmarks
      404 Analysis ID not found or expired
-     429 Upstream rate limit
+     429 AI concurrency/request budget or upstream rate limit
      502 DeepSeek/upstream failure
      503 Model asset or backend service unavailable
      500 Unexpected server error
@@ -55,7 +56,8 @@ Error codes: - `INVALID_IMAGE` - `UNSUPPORTED_IMAGE_TYPE` -
 `IMAGE_TOO_LARGE` - `NO_PERSON_DETECTED` - `INSUFFICIENT_LANDMARKS` -
 `LOW_LANDMARK_VISIBILITY` - `DEGENERATE_GEOMETRY` -
 `ANALYSIS_SESSION_EXPIRED` - `REPORT_GENERATION_FAILED` -
-`ASSISTANT_REQUEST_FAILED` - `MODEL_ASSET_MISSING` - `LLM_NOT_CONFIGURED` - `INVALID_REQUEST` - `INTERNAL_ERROR`
+`ASSISTANT_REQUEST_FAILED` - `MODEL_ASSET_MISSING` - `LLM_NOT_CONFIGURED` - `INVALID_REQUEST` - `AI_BUSY` -
+`AI_RATE_LIMITED` - `ANALYSIS_BUSY` - `REQUEST_TIMEOUT` - `INTERNAL_ERROR`
 
 ## 3. `GET /api/health`
 
@@ -264,7 +266,10 @@ If DeepSeek fails or the output cannot be validated:
 ```
 
 Use HTTP 502 for upstream failures and preserve the analysis cache entry
-so the user can retry.
+so the user can retry. Concurrent requests for the same valid analysis share
+one generation. A successful report may be reused in RAM for up to 60 seconds
+(and at most the remaining analysis TTL), with a 64-entry bound. Failures are
+not cached. Report reuse never creates long-term report history.
 
 ## 6. `POST /api/v1/assistant`
 
@@ -434,3 +439,19 @@ handle all optional/null states explicitly.
 -   Consider a lightweight per-session/request rate limit for public
     tunnel demos.
 -   Do not treat CORS as authentication.
+
+
+## Runtime bounds
+
+The local service allows two concurrent AI generations and up to 20 new AI
+requests per rolling 60 seconds. Report coalescing/reuse does not spend another
+upstream request. Report/chat generation and its optional format repair share
+one timeout budget (default 30 seconds). Truncated/refused upstream output does
+not trigger format repair. The gateway permits 16 connections and four API
+requests concurrently and rejects cross-origin mutation requests.
+
+Image upload reading is limited to 20 seconds, waiting for a vision slot to two
+seconds, and JSON body reading to ten seconds. Failures keep the common error
+schema: `AI_BUSY` and `AI_RATE_LIMITED` use 429, `ANALYSIS_BUSY` uses 503, and
+`REQUEST_TIMEOUT` uses 408. These are transient service conditions, not image
+quality or health findings.

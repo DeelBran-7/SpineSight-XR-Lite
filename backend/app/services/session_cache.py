@@ -15,6 +15,8 @@ class SessionCache:
         max_entries: int = 256,
         clock: Callable[[], float] = monotonic,
     ) -> None:
+        if ttl_seconds <= 0 or max_entries < 1:
+            raise ValueError("Cache TTL and capacity must be positive.")
         self._ttl = ttl_seconds
         self._max_entries = max_entries
         self._clock = clock
@@ -44,3 +46,10 @@ class SessionCache:
         if entry is None:
             raise ApiError(404, "ANALYSIS_SESSION_EXPIRED", "The analysis session has expired. Capture a new photo to continue.")
         return entry[1]
+
+    def remaining_ttl(self, analysis_id: UUID) -> float:
+        with self._lock:
+            now = self._clock()
+            self._expire(now)
+            entry = self._entries.get(analysis_id)
+        return max(0, self._ttl - (now - entry[0])) if entry is not None else 0

@@ -1,3 +1,4 @@
+import asyncio
 from io import BytesIO
 
 import numpy as np
@@ -14,6 +15,7 @@ MAX_MULTIPART_OVERHEAD_BYTES = 16 * 1024
 MAX_IMAGE_PIXELS = 20_000_000
 MAX_IMAGE_SIDE = 8192
 SUPPORTED_FORMATS = {"JPEG", "PNG", "WEBP"}
+UPLOAD_TIMEOUT_SECONDS = 20
 
 
 def invalid_upload() -> ApiError:
@@ -85,6 +87,8 @@ async def read_image_upload(request: Request, output: BytesIO) -> None:
         content_length = int(request.headers.get("content-length", "0"))
     except ValueError:
         raise invalid_upload() from None
+    if content_length < 0:
+        raise invalid_upload()
     if content_length > limit:
         raise upload_too_large()
 
@@ -103,13 +107,16 @@ async def read_image_upload(request: Request, output: BytesIO) -> None:
     )
     received = 0
     try:
-        async for chunk in request.stream():
-            received += len(chunk)
-            if received > limit:
-                raise upload_too_large()
-            if chunk:
-                parser.write(chunk)
+        async with asyncio.timeout(UPLOAD_TIMEOUT_SECONDS):
+            async for chunk in request.stream():
+                received += len(chunk)
+                if received > limit:
+                    raise upload_too_large()
+                if chunk:
+                    parser.write(chunk)
         parser.finalize()
+    except TimeoutError:
+        raise ApiError(408, "REQUEST_TIMEOUT", "The photo upload timed out. Please try again.") from None
     except (MultipartParseError, ClientDisconnect):
         raise invalid_upload() from None
 
@@ -136,7 +143,9 @@ def decode_image(source: BytesIO) -> np.ndarray:
                 raise decoded_image_too_large()
             if getattr(image, "n_frames", 1) != 1:
                 raise ApiError(400, "UNSUPPORTED_IMAGE_TYPE", "Upload a single still image.")
-            with ImageOps.exif_transpose(image) as oriented, oriented.convert("RGB") as rgb:
+            # Transpose the open image in place to avoid retaining another full-size copy.
+            ImageOps.exif_transpose(image, in_place=True)
+            with image.convert("RGB") as rgb:
                 return np.array(rgb, dtype=np.uint8)
     except Image.DecompressionBombError:
         raise decoded_image_too_large() from None

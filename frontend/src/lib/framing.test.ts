@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { cameraErrorMessage, stopTracks } from "@/hooks/useCamera";
 import { speechAvailable } from "@/hooks/useVoiceGuidance";
-import { evaluateFraming, FRAME_MAX_AGE_MS, mayCapture, type PosePoint } from "./framing";
+import { evaluateFraming, FRAME_MAX_AGE_MS, frameSize, mayCapture, type PosePoint } from "./framing";
 
 function pose(): PosePoint[] {
   const points: PosePoint[] = [];
@@ -25,10 +25,10 @@ describe("live framing", () => {
     expect(evaluateFraming(points)).toBe("low_visibility");
   });
 
-  it("requires a visible head landmark", () => {
+  it("allows back-view capture when face and ears are not visible", () => {
     const points = pose();
     points[7].visibility = 0.59;
-    expect(evaluateFraming(points)).toBe("low_visibility");
+    expect(evaluateFraming(points)).toBe("ready");
   });
 
   it("asks a person outside the center band to move toward the center", () => {
@@ -51,6 +51,8 @@ describe("live framing", () => {
     expect(mayCapture(state, 100, 100 + FRAME_MAX_AGE_MS)).toBe(true);
     expect(mayCapture(state, 100, 101 + FRAME_MAX_AGE_MS)).toBe(false);
     expect(mayCapture("no_pose", 100, 100)).toBe(false);
+    expect(mayCapture("ready", 101, 100)).toBe(false);
+    expect(mayCapture("ready", Number.NaN, 100)).toBe(false);
   });
 });
 
@@ -73,4 +75,10 @@ describe("camera and speech capability", () => {
   it("supports capture without speech synthesis", () => {
     expect(speechAvailable({})).toBe(false);
   });
+});
+
+it("bounds live and captured frame allocations without stretching the camera image", () => {
+  expect(frameSize(3840, 2160, false)).toEqual({ width: 768, height: 432 });
+  expect(frameSize(2160, 3840, true)).toEqual({ width: 900, height: 1600 });
+  expect(frameSize(640, 480, false)).toEqual({ width: 640, height: 480 });
 });

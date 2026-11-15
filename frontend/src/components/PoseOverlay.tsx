@@ -28,7 +28,8 @@ export function PoseOverlay({ landmarks, width, height, live = false }: {
       {[[ls, rs], [lh, rh], [shoulder, hip]].map(([start, end], index) => (
         <g key={index}>
           <line x1={start.x * width} y1={start.y * height} x2={end.x * width} y2={end.y * height}
-            stroke="#162c42" strokeWidth={5} vectorEffect="non-scaling-stroke" strokeLinecap="round" />
+            stroke="#162c42" strokeWidth={5} strokeDasharray={index === 2 ? "4 6" : undefined}
+            vectorEffect="non-scaling-stroke" strokeLinecap="round" />
           <line x1={start.x * width} y1={start.y * height} x2={end.x * width} y2={end.y * height}
             stroke={color} strokeWidth={2} strokeDasharray={index === 2 ? "4 6" : undefined}
             vectorEffect="non-scaling-stroke" strokeLinecap="round" />

@@ -8,19 +8,55 @@ import hmac
 import http.client
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+import re
 import secrets
 import shutil
 import subprocess
 import threading
-from urllib.parse import urlsplit
+import time
+from urllib.parse import parse_qs, urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
 MAX_BODY = 8 * 1024 * 1024 + 65536
 MAX_RESPONSE_BODY = 2 * 1024 * 1024
+BODY_TIMEOUT_SECONDS = 30
+
+
+class BoundedThreadingHTTPServer(ThreadingHTTPServer):
+    """A private demo should not allocate a thread per unbounded tunnel connection."""
+
+    daemon_threads = True
+
+    def __init__(self, *args, max_connections=16, **kwargs):
+        self._connections = threading.BoundedSemaphore(max_connections)
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request, client_address):
+        if not self._connections.acquire(blocking=False):
+            try:
+                request.settimeout(1)
+                request.sendall(b"HTTP/1.0 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            except OSError:
+                pass
+            finally:
+                self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._connections.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._connections.release()
 
 
 def make_handler(directory: Path, password: str, *, backend_port: int = 8000):
     expected = "Basic " + base64.b64encode(f"observer:{password}".encode()).decode()
+    api_slots = threading.BoundedSemaphore(4)
 
     class Handler(SimpleHTTPRequestHandler):
         def __init__(self, *args, **kwargs):
@@ -34,10 +70,14 @@ def make_handler(directory: Path, password: str, *, backend_port: int = 8000):
             pass  # Never log authorization, submitted content, or URL parameters.
 
         def end_headers(self):
-            self.send_header("Cache-Control", "no-store")
+            policy = "private, max-age=3600" if getattr(self, "cache_static_asset", False) else "no-store"
+            self.send_header("Cache-Control", policy)
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("Referrer-Policy", "same-origin")
             self.send_header("Permissions-Policy", "camera=(self), microphone=()")
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("Content-Security-Policy", "frame-ancestors 'none'; object-src 'none'; base-uri 'self'")
+            self.send_header("Cross-Origin-Resource-Policy", "same-origin")
             super().end_headers()
 
         def authorize(self) -> bool:
@@ -52,6 +92,15 @@ def make_handler(directory: Path, password: str, *, backend_port: int = 8000):
             return False
 
         def proxy(self):
+            if not api_slots.acquire(blocking=False):
+                self.send_error(503, "The demo is busy. Please try again shortly.")
+                return
+            try:
+                self.proxy_request()
+            finally:
+                api_slots.release()
+
+        def proxy_request(self):
             lengths = self.headers.get_all("Content-Length", [])
             if len(lengths) > 1 or self.headers.get("Transfer-Encoding"):
                 self.send_error(400, "Unsupported request framing")
@@ -65,14 +114,25 @@ def make_handler(directory: Path, password: str, *, backend_port: int = 8000):
                 self.send_error(413, "Upload exceeds 8 MiB limit")
                 return
             try:
-                body = self.rfile.read(length) if length else None
+                body = bytearray() if length else None
+                deadline = time.monotonic() + BODY_TIMEOUT_SECONDS
+                while body is not None and len(body) < length:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError
+                    self.connection.settimeout(remaining)
+                    chunk = self.rfile.read1(min(65536, length - len(body)))
+                    if not chunk:
+                        break
+                    body.extend(chunk)
+                self.connection.settimeout(30)
             except TimeoutError:
                 self.send_error(408, "Request body timed out")
                 return
             if body is not None and len(body) != length:
                 self.send_error(400, "Incomplete request")
                 return
-            connection = http.client.HTTPConnection("127.0.0.1", backend_port, timeout=65)
+            connection = http.client.HTTPConnection("127.0.0.1", backend_port, timeout=95)
             try:
                 headers = {"Content-Type": self.headers.get("Content-Type", "application/json")}
                 connection.request(self.command, self.path, body=body, headers=headers)
@@ -95,9 +155,17 @@ def make_handler(directory: Path, password: str, *, backend_port: int = 8000):
                 self.wfile.write(payload)
 
         def route(self):
+            self.cache_static_asset = False
             if not self.authorize():
                 return
-            path = urlsplit(self.path).path
+            parsed = urlsplit(self.path)
+            if parsed.scheme or parsed.netloc:
+                self.send_error(400, "Invalid request target")
+                return
+            path = parsed.path
+            if self.command == "POST" and not self.same_origin_submission():
+                self.send_error(403, "Open the private demo directly to submit a request.")
+                return
             if path.startswith("/api/"):
                 self.proxy()
                 return
@@ -113,10 +181,42 @@ def make_handler(directory: Path, password: str, *, backend_port: int = 8000):
                     self.send_error(404)
                     return
                 self.path = "/index.html"
+            else:
+                version = parse_qs(parsed.query).get("v", [""])[0]
+                self.cache_static_asset = bool(
+                    (path.startswith("/models/") and re.fullmatch(r"[a-f0-9]{64}", version))
+                    or (path.startswith("/wasm/") and re.fullmatch(r"\d+\.\d+\.\d+(?:[-.][\w.-]+)?", version))
+                    or (path.startswith("/assets/") and re.search(r"-[A-Za-z0-9_-]{8,}\.[A-Za-z0-9]+$", path))
+                )
             if self.command == "HEAD":
                 super().do_HEAD()
             else:
                 super().do_GET()
+
+        def same_origin_submission(self) -> bool:
+            # Basic credentials are ambient browser credentials. CORS alone does not
+            # stop a hostile site's form from spending API tokens via a cached login.
+            fetch_site = self.headers.get("Sec-Fetch-Site")
+            if fetch_site is not None and fetch_site != "same-origin":
+                return False
+            origin = self.headers.get("Origin")
+            if origin is None:
+                return True  # Local CLI clients do not emit browser Origin metadata.
+            try:
+                source = urlsplit(origin)
+                host = self.headers.get("Host", "").lower()
+                return (
+                    source.netloc.lower() == host
+                    and source.username is None
+                    and source.password is None
+                    and not (source.path or source.query or source.fragment)
+                    and (
+                        source.scheme == "https"
+                        or (source.scheme == "http" and source.hostname in ("127.0.0.1", "localhost", "::1"))
+                    )
+                )
+            except ValueError:
+                return False
 
         do_GET = route
         do_HEAD = route
@@ -136,8 +236,7 @@ def main():
     if not args.no_tunnel and not cloudflared:
         raise SystemExit("Install cloudflared first (macOS: brew install cloudflared).")
     password = secrets.token_urlsafe(12)
-    server = ThreadingHTTPServer(("127.0.0.1", 5180), make_handler(directory, password))
-    server.daemon_threads = True
+    server = BoundedThreadingHTTPServer(("127.0.0.1", 5180), make_handler(directory, password))
     worker = threading.Thread(target=server.serve_forever, daemon=True)
     worker.start()
     print(f"Private demo login\nUsername: observer\nPassword: {password}\nKeep this terminal open. Ctrl+C stops access.\n", flush=True)

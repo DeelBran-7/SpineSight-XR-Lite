@@ -5,14 +5,14 @@ export function speechAvailable(browser: Partial<Window> = window) {
   return !!browser.speechSynthesis && typeof SpeechSynthesisUtterance !== "undefined";
 }
 
-export function useVoiceGuidance(status: Guidance) {
+export function useVoiceGuidance(status: Guidance, announcement?: string) {
   const available = speechAvailable();
   const [muted, setMuted] = useState(true);
-  const previous = useRef<Guidance | null>(null);
+  const previous = useRef<string | null>(null);
 
-  const announce = useCallback((next: Guidance) => {
-    if (!available || previous.current === next) return;
-    const utterance = new SpeechSynthesisUtterance(guidance[next].title);
+  const announce = useCallback((next: string) => {
+    if (!available || document.visibilityState === "hidden" || previous.current === next) return;
+    const utterance = new SpeechSynthesisUtterance(next);
     utterance.lang = "en-US";
     window.speechSynthesis.cancel();
     window.speechSynthesis.speak(utterance);
@@ -22,21 +22,31 @@ export function useVoiceGuidance(status: Guidance) {
   const toggle = useCallback(() => {
     if (!available) return;
     if (muted) {
-      announce(status);
+      announce(announcement ?? guidance[status].title);
       setMuted(false);
     } else {
       window.speechSynthesis.cancel();
       previous.current = null;
       setMuted(true);
     }
-  }, [announce, available, muted, status]);
+  }, [announce, announcement, available, muted, status]);
 
   useEffect(() => {
-    if (!muted) announce(status);
-  }, [announce, muted, status]);
+    if (!muted) announce(announcement ?? guidance[status].title);
+  }, [announce, announcement, muted, status]);
 
-  useEffect(() => () => {
-    if (available) window.speechSynthesis.cancel();
+  useEffect(() => {
+    const pause = () => {
+      if (available && document.visibilityState === "hidden") {
+        window.speechSynthesis.cancel();
+        previous.current = null;
+      }
+    };
+    document.addEventListener("visibilitychange", pause);
+    return () => {
+      document.removeEventListener("visibilitychange", pause);
+      if (available) window.speechSynthesis.cancel();
+    };
   }, [available]);
 
   return { available, muted, toggle };

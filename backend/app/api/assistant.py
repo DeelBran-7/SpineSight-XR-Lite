@@ -10,7 +10,7 @@ from app.services.llm_service import LLMError
 router = APIRouter(prefix="/v1", route_class=BoundedJSONRoute)
 
 
-@router.post("/assistant", responses=error_responses(400, 404, 413, 429, 502, 503, 500))
+@router.post("/assistant", responses=error_responses(400, 404, 408, 413, 429, 502, 503, 500))
 async def assistant(payload: AssistantRequest, runtime: RuntimeDependency) -> AssistantResponse:
     analysis = None
     if payload.analysis_id is not None:

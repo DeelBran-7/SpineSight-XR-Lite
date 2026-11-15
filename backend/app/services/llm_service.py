@@ -4,8 +4,10 @@ import asyncio
 import json
 import math
 import re
+from collections import deque
 from collections.abc import Callable, Iterable
 from decimal import Decimal, InvalidOperation
+from time import monotonic
 from typing import Literal, TypeVar
 
 from openai import AsyncOpenAI, OpenAIError
@@ -16,6 +18,8 @@ from app.schemas import Report, ReportText
 
 _MAX_MESSAGE_LENGTH = 1200
 _MAX_HISTORY_MESSAGES = 8
+_MAX_CONCURRENT_REQUESTS = 2
+_MAX_REQUESTS_PER_MINUTE = 20
 
 _NOT_CONFIGURED = "The AI service is not configured."
 _REPORT_ERROR = (
@@ -31,9 +35,11 @@ _REPORT_PROMPT = f"""Write concise English reports for SpineSight XR Lite from s
 2D measurements and observation directions. Explain the geometry in the image. Discuss the
 shoulder and hip height offsets and torso midpoint offset. Use brief qualitative descriptions;
 numeric values are already displayed in measurement cards, so avoid repeating them.
+Keep both summaries qualitative; any numeric detail belongs in its feature finding.
 Any cited measurement must keep its exact value, sign, unit, and associated feature.
 Avoid diagnoses, clinical labels, scores, disease probabilities, and treatment, medication,
-or exercise advice. Keep the disclaimer verbatim. Return plain text in this single JSON object:
+or exercise advice. Do not infer spinal curvature or Cobb angle. Keep the disclaimer verbatim.
+Return plain text in this single JSON object:
 {{
   "simple_summary": "The shoulder and hip landmarks can be compared in the photo.",
   "technical_summary": "The measurements use 2D landmarks with image aspect ratio accounted for.",
@@ -64,7 +70,8 @@ coordinates: normalized x times image width and normalized y times image height.
 Positive line angles slope down toward screen right; positive torso lean is toward
 screen right. Anatomical left and right come from the supplied observation labels.
 Avoid diagnoses, clinical labels, scores, disease probabilities, and treatment, medication, or
-exercise advice. For health concerns, explain the app's limits and suggest professional assessment.
+exercise advice. Do not infer spinal curvature or Cobb angle. For health concerns, explain the
+app's limits and suggest professional assessment.
 Return one concise plain text reply in this JSON format: {"reply": "Keep your hips visible."}
 """
 
@@ -84,26 +91,41 @@ _DIMENSION = re.compile(r"\b2[ -]?d\b", re.IGNORECASE)
 _LABEL = re.compile(r"[a-z][a-z_]{0,63}")
 
 _CLINICAL_ASSERTION = re.compile(
-    r"\b(?:you (?:have|(?:may|might|could) have|(?:likely|probably) have)|"
+    r"\b(?:you (?:have|(?:do not|don't) have|are free (?:of|from)|(?:may|might|could) have|(?:likely|probably) have)|"
+    r"there is no|(?:shows?|detects?) no(?: signs? of)?|"
     r"(?:shows?|indicates?|confirms?|rules? out|caused by|diagnosed with|consistent with|"
     r"positive for|(?:risk|probability|chance|likelihood) of))\b[^.!?]{0,45}\b"
     r"(?:scoliosis|kyphosis|lordosis|[a-z-]+ (?:disease|disorder)|medical condition)\b"
-    r"|\b(?:posture|results?|measurements?|spine|alignment)\s+(?:is|are|looks?|seems?|appears?)\s+"
-    r"(?:clinically\s+)?(?:normal|abnormal)\b"
+    r"|\b(?:angles?|offsets?|posture|results?|measurements?|spine|alignment|shoulders?|hips?|torso)\s+"
+    r"(?:is|are|looks?|seems?|appears?)\s+(?:clinically\s+)?(?:normal|abnormal|healthy|unhealthy)\b"
 )
 _TREATMENT_ADVICE = re.compile(
-    r"\b(?:perform|do|try|start|prescribe|take|follow|recommend|should)\b[^.!?]{0,38}\b"
+    r"\b(?:perform|do(?!\s+not\b)|try|start|prescribe|take|follow|recommend|should(?!\s+(?:not|never)\b))\b[^.!?,;]{0,38}\b"
     r"(?:exercises?|stretches?|stretching|medication|painkillers?|ibuprofen|acetaminophen|"
     r"physical therapy|side planks?|dead hangs?)\b"
 )
 _PERSONAL_OBSERVATION = re.compile(
     r"\byour (?:(?:left|right) )?(?:shoulders?|hips?|torso|posture)(?: (?:line|landmarks?))? "
-    r"(?:is|are|looks?|appears?|leans?|tilts?)\b[^.!?]{0,35}\b"
-    r"(?:higher|lower|left|right|level|aligned|asymmetric|tilted|offset)\b",
+    r"(?:is|are|looks?|appears?|leans?|tilts?|shows?|has|have)\b[^.!?]{0,35}\b"
+    r"(?:higher|lower|left|right|level|aligned|asymmetric|asymmetry|uneven|tilted|offset)\b"
+    r"|\byou (?:lean|tilt) (?:to the )?(?:left|right)\b",
     re.IGNORECASE,
 )
-_NEGATION = re.compile(r"\b(?:cannot|can't|not|no way|unable to|never)\b")
+# Negation must govern the matched claim, not an unrelated earlier sentence fragment.
+_NEGATION = re.compile(
+    r"\b(?:cannot|can't|don't|do not|does not|did not|will not|would not|should not|never|unable to)\s*"
+    r"(?:(?:tell|say|determine|know|conclude|establish|assess)\s+(?:whether|if)\s*"
+    r"|(?:diagnose|confirm|determine|detect|rule out)\s+(?:or|and)\s*)?$"
+)
 _STATEMENT_BOUNDARY = re.compile(r"[!?;\n]+|(?<!\d)\.|\.(?!\d)|\b(?:but|however)\b")
+_HEIGHT_RELATION = re.compile(
+    r"\b(left|right)(?:\s+(?:shoulder|hip|landmark)){0,2}"
+    r"(?:\s+(?:is|was|appears|looks|sits|seems))?\s+(higher|lower)\b", re.IGNORECASE,
+)
+_TORSO_RELATION = re.compile(
+    r"\b(?:leans?|tilts?|offset|shifted|displaced)(?:\s+(?:toward|to|is|slightly|the|screen))*\s+(left|right)\b",
+    re.IGNORECASE,
+)
 
 
 class LLMError(Exception):
@@ -189,16 +211,47 @@ def _grounded_prose(text: str, values: Iterable[int | float]) -> bool:
 def _valid_reply(reply: str, context: dict | None) -> bool:
     if context is None:
         return not _PERSONAL_OBSERVATION.search(reply) and _grounded_prose(reply, ())
-    return _grounded_prose(reply, context["measurements"].values())
+    return _grounded_prose(reply, context["measurements"].values()) and _valid_units(reply, context["measurements"])
 
 
-def _valid_report(report: _ReportOutput, measurements: dict) -> bool:
-    if not _grounded_prose(report.simple_summary, measurements.values()):
+def _valid_units(text: str, measurements: dict) -> bool:
+    """Do not accept a real percentage misquoted as an angle (or vice versa)."""
+    text = _DIMENSION.sub("", text)
+    for match in _NUMBER.finditer(text):
+        unit = re.match(r"\s*(%|percent\b|degrees?\b|°)", text[match.end():], re.IGNORECASE)
+        if unit is None:
+            continue  # Unqualified numbers still undergo exact value validation above.
+        suffix = "_percent" if unit.group(1).lower() in ("%", "percent") else "_deg"
+        allowed = {Decimal(str(value)) for name, value in measurements.items() if name.endswith(suffix)}
+        if Decimal(match.group().replace("−", "-").replace(",", "")) not in allowed:
+            return False
+    return True
+
+
+def _valid_direction(text: str, feature: str, direction: str) -> bool:
+    if feature == "torso":
+        expected = {"leftward_lateral_offset": "left", "rightward_lateral_offset": "right"}.get(direction)
+        return all(match.group(1).lower() == expected for match in _TORSO_RELATION.finditer(text))
+    higher = {"left_landmark_higher_in_image": "left", "right_landmark_higher_in_image": "right"}.get(direction)
+    for match in _HEIGHT_RELATION.finditer(text):
+        side, relation = (part.lower() for part in match.groups())
+        if higher is None or (side == higher) != (relation == "higher"):
+            return False
+    return True
+
+
+def _valid_report(report: _ReportOutput, context: dict) -> bool:
+    measurements = context["measurements"]
+    if not _grounded_prose(report.simple_summary, ()):
         return False
-    if not _grounded_prose(report.technical_summary, measurements.values()):
+    if not _grounded_prose(report.technical_summary, ()):
         return False
     for feature, fields in _FEATURE_MEASUREMENTS.items():
-        if not _grounded_prose(getattr(report.findings, feature), (measurements[field] for field in fields)):
+        finding = getattr(report.findings, feature)
+        values = {field: measurements[field] for field in fields}
+        if not _grounded_prose(finding, values.values()) or not _valid_units(finding, values):
+            return False
+        if not _valid_direction(finding, feature, context["observations"][feature]["direction"]):
             return False
     if any(not _grounded_prose(item, ()) for item in report.limitations):
         return False
@@ -229,6 +282,8 @@ class LLMService:
         key = (api_key or "").strip()
         self._model = model.strip()
         self._timeout = timeout_seconds
+        self._slots = asyncio.Semaphore(_MAX_CONCURRENT_REQUESTS)
+        self._request_times: deque[float] = deque()
         self.configured = bool(key and base_url.strip() and self._model)
         self._client = (
             AsyncOpenAI(api_key=key, base_url=base_url.strip(), timeout=timeout_seconds, max_retries=0)
@@ -256,7 +311,7 @@ class LLMService:
             _REPORT_PROMPT,
             context,
             _ReportOutput,
-            lambda result: _valid_report(result, context["measurements"]),
+            lambda result: _valid_report(result, context),
             LLMError("REPORT_GENERATION_FAILED", _REPORT_ERROR),
             max_tokens=1000,
         )
@@ -302,6 +357,16 @@ class LLMService:
         error: LLMError,
         max_tokens: int,
     ) -> _Output:
+        # This private demo has one local backend and no user accounts. Bound spend
+        # globally instead of trusting spoofable client IPs from the phone proxy.
+        if self._slots.locked():
+            raise LLMError("AI_BUSY", "The AI service is busy. Please try again shortly.", 429)
+        now = monotonic()
+        while self._request_times and now - self._request_times[0] >= 60:
+            self._request_times.popleft()
+        if len(self._request_times) >= _MAX_REQUESTS_PER_MINUTE:
+            raise LLMError("AI_RATE_LIMITED", "Please wait a minute before asking the AI again.", 429)
+        self._request_times.append(now)
         messages: list[ChatCompletionMessageParam] = [
             {"role": "system", "content": prompt},
             {"role": "user", "content": json.dumps(payload, separators=(",", ":"), allow_nan=False)},
@@ -312,7 +377,7 @@ class LLMService:
         ]
 
         try:
-            async with asyncio.timeout(self._timeout):
+            async with self._slots, asyncio.timeout(self._timeout):
                 for request_messages in (messages, repair_messages):
                     completion = await client.chat.completions.create(
                         model=self._model,
@@ -323,7 +388,8 @@ class LLMService:
                     )
                     choices = getattr(completion, "choices", None)
                     if not choices or getattr(choices[0], "finish_reason", None) != "stop":
-                        continue
+                        # A refusal or exhausted output budget is not a format error.
+                        break
                     message = getattr(choices[0], "message", None)
                     content = getattr(message, "content", None)
                     if not isinstance(content, str) or not content.strip() or len(content) > 12000:

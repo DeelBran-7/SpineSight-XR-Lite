@@ -1,6 +1,6 @@
 # SpineSight XR Lite --- Project Specification
 
-**Version:** 1.1\
+**Version:** 1.2\
 **Status:** Requirements baseline for MVP\
 **Target:** Solo developer using Codex\
 **Target schedule:** 48-hour prototype\
@@ -416,8 +416,10 @@ Initial rules: 1. A pose must be detected. 2. Require the four core
 landmarks. 3. Each core landmark visibility should be at least `0.60`.
 4. Calculate the center X coordinate of the four core landmarks and
 require it to be within `0.35–0.65` as an initial framing range. 5.
-Estimate a bounding box from visible head/shoulder/hip landmarks and
-apply configurable minimum/maximum scale bounds. 6. Display clear
+Use visible head landmarks to strengthen framing when available; head
+visibility is not a hard requirement for a back-facing user. Otherwise apply
+conservative shoulder-to-hip span and frame-margin bounds without inventing
+head landmarks. These checks do not prove that the head or upper thighs are in frame. 6. Display clear
 instructions when a check fails. 7. Enable capture if the current frame
 passes all configured checks.
 
@@ -452,8 +454,10 @@ every frame. Handle browsers where speech synthesis is unavailable.
 -   Throttle inference to an initial target of approximately 5--10 FPS.
 -   Keep camera preview rendering independent of inference.
 -   Do not upload video frames.
--   Stop all camera tracks on navigation, unmount, and capture
-    completion.
+-   Stop all camera tracks on navigation, unmount, capture completion, and
+    when the tab is hidden. Cancel countdowns and pending captures while hidden.
+-   Reject stale inference/photo results, recover stalled workers, and use a
+    default ten-second countdown for self-capture.
 -   Test on at least one real iOS or Android phone if available.
 
 ------------------------------------------------------------------------
@@ -577,7 +581,10 @@ Use a simple in-memory TTL cache, not a database.
 -   Cache only structured measurements, landmarks, quality metadata, and
     rule observations.
 -   Never cache the original image.
--   No persistent report or chat history.
+-   No persistent report or chat history. For retry deduplication, a separate
+    bounded in-memory report map may retain at most 64 generated reports for
+    60 seconds, capped by each analysis session’s remaining TTL. Chat is not
+    cached on the backend.
 -   Expired or unknown ID returns `ANALYSIS_SESSION_EXPIRED`.
 -   Clear entries periodically or lazily on access.
 -   Starting a new analysis creates a new ID.

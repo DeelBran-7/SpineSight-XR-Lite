@@ -10,12 +10,17 @@ from app.services.llm_service import LLMError
 router = APIRouter(prefix="/v1", route_class=BoundedJSONRoute)
 
 
-@router.post("/report", responses=error_responses(400, 404, 413, 429, 502, 503, 500))
+@router.post("/report", responses=error_responses(400, 404, 408, 413, 429, 502, 503, 500))
 async def report(payload: ReportRequest, runtime: RuntimeDependency) -> ReportResponse:
     analysis = runtime.cache.require(payload.analysis_id)
     try:
-        data = await runtime.llm.generate_report(analysis.model_dump(mode="json"))
-        generated = Report.model_validate(data)
+        async def generate() -> Report:
+            data = await runtime.llm.generate_report(analysis.model_dump(mode="json"))
+            return Report.model_validate(data)
+
+        generated = await runtime.reports.get_or_create(
+            analysis.analysis_id, generate, runtime.cache.remaining_ttl(analysis.analysis_id)
+        )
     except LLMError as error:
         raise ApiError(error.status_code, error.code, error.message) from None
     except ValidationError:

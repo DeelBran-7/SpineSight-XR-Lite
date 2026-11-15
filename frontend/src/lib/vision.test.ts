@@ -9,7 +9,7 @@ it("reports a missing model when the server responds with its HTML route fallbac
   }));
   vi.stubGlobal("fetch", fetcher);
   await expect(createPoseLandmarker("http://localhost:5173/capture", false)).rejects.toThrow("model is unavailable");
-  expect(fetcher.mock.calls[0][0]).toBe("http://localhost:5173/models/pose_landmarker_lite.task");
+  expect(fetcher.mock.calls[0][0]).toBe("http://localhost:5173/models/pose_landmarker_lite.task?v=59929e1d1ee95287735ddd833b19cf4ac46d29bc7afddbbf6753c459690d574a");
 });
 
 it("reports unavailable model assets after an HTTP error", async () => {

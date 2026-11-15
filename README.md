@@ -65,7 +65,7 @@ The phone's browser needs a trusted HTTPS origin. A plain computer LAN IP over H
 5. Open the printed `https://…trycloudflare.com` address on your phone. Enter username `observer` and the random password printed in that terminal.
 6. Accept the in-app notice, allow camera access, and follow the capture instructions. Use the countdown when standing with your back to the phone.
 
-The phone helper serves the built frontend and proxies `/api` through a password gate on loopback port 5180. The public HTTPS tunnel reaches only that gate; FastAPI stays bound to `127.0.0.1:8000`. The password is generated in memory and never embedded in a URL or saved. Ctrl+C closes the gateway and tunnel. Rebuild after frontend changes. An account-free Quick Tunnel is for temporary demos and may be unavailable on some networks; use a protected named tunnel if your network requires it.
+The phone helper serves the built frontend and proxies `/api` through a password gate on loopback port 5180. It rejects cross-origin mutation requests and limits concurrent work. The public HTTPS tunnel reaches only that gate; FastAPI stays bound to `127.0.0.1:8000`. The password is generated in memory and never embedded in a URL or saved. Ctrl+C closes the gateway and tunnel. Rebuild after frontend changes. An account-free Quick Tunnel is for temporary demos and may be unavailable on some networks; use a protected named tunnel if your network requires it.
 
 Topology: phone → HTTPS tunnel → password gate/built frontend → local FastAPI.
 
@@ -74,19 +74,20 @@ The installed cloudflared version does not support the newer `--allowed-mail` fl
 ## Features
 
 - Consent, capture instructions, camera, preview/retake, results, and separate assistant pages.
-- Live browser MediaPipe guidance, optional speech, mute, and countdown; camera/model resources released on exit.
+- Live browser MediaPipe guidance, optional speech, mute, and a default ten-second selfie countdown. Hidden tabs release the camera and cancel pending captures; returning resumes it. Stale frames are rejected and stalled inference has a recovery timeout.
 - Optional photo upload for desktop use; decoded image quality is still checked by the backend.
-- Real backend pose inference with four shoulder/hip landmarks; SVG overlay uses backend coordinates.
+- Real backend pose inference with four shoulder/hip landmarks; SVG overlay uses backend coordinates. Head landmarks are optional for live guidance, so a back-facing user is not blocked by an invisible nose.
+- Live inference uses frames up to 768px, capture up to 1600px, with aspect ratio preserved. Versioned public model/WASM assets are privately cached; user API responses remain no-store.
 - Five geometric measurements, aspect-ratio correction, signed angles, and expandable technical details.
-- Explicitly requested AI report and chat; no automatic paid calls. An existing report remains in session memory.
+- Explicitly requested AI report and chat; no automatic paid calls. Identical in-flight requests are shared and successful answers stay in session memory. A brief, bounded backend report reuse window avoids charging again on network retries.
 - Report output capped at 1,000 tokens; chat at 500; thinking disabled and at most one format repair. Chat sends at most eight recent messages.
-- Clear errors and retry; an AI failure preserves the visual analysis.
+- Clear errors and retry; an AI failure preserves the visual analysis. An expired analysis can be renewed from the photo still held in the tab, without another capture.
 
 ## Data handling
 
 - No accounts, database, persistent photos, or history.
 - Photos are decoded in memory, never written by the application to a temporary upload file, and never sent to DeepSeek.
-- Only structured analysis is cached in backend memory for 30 minutes (bounded capacity); restart clears it.
+- Structured analysis is cached in backend memory for 30 minutes (bounded capacity). Generated reports may be reused in memory for at most 60 seconds and never beyond their analysis expiry; this is bounded to 64 entries. Restart clears both. No backend chat history is retained.
 - Photo preview, reports, consent, and chat live in browser memory for the current session.
 - AI requests send measurements/observation labels and, for chat, recent messages. Provider-side retention is governed by DeepSeek's terms; the app does not promise zero retention by third parties.
 - Upload limit: 8 MiB; decoded image limit: 20 megapixels and 8192 pixels per side. Supported still formats: JPEG, PNG, WebP.

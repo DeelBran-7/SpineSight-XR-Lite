@@ -3,10 +3,18 @@ import { useEffect, useRef, type ReactNode } from "react";
 import { Link, Outlet, useLocation } from "react-router";
 import { cn } from "@/lib/utils";
 
+const pageNames: Record<string, string> = {
+  "/": "2D posture observation", "/privacy": "Your privacy", "/instructions": "Capture setup",
+  "/capture": "Camera", "/preview": "Review your photo", "/results": "Your observation", "/assistant": "Assistant",
+};
+
 export function Layout() {
   const location = useLocation();
   const previousPath = useRef(location.pathname);
   const main = useRef<HTMLElement>(null);
+  useEffect(() => {
+    document.title = `${pageNames[location.pathname] ?? "2D posture observation"} · SpineSight XR Lite`;
+  }, [location.pathname]);
   useEffect(() => {
     if (previousPath.current === location.pathname) return;
     previousPath.current = location.pathname;
@@ -23,8 +31,8 @@ export function Layout() {
             <span>SpineSight <span className="brand-lite">XR Lite</span></span>
           </Link>
           <nav className="site-nav" aria-label="Main navigation">
-            <Link to="/privacy" className="nav-privacy"><ShieldCheck size={17} /> <span>Privacy</span></Link>
-            <Link to="/assistant" className="nav-assistant"><MessageCircle size={17} /> <span>Assistant</span></Link>
+            <Link to="/privacy" className="nav-privacy" aria-current={location.pathname === "/privacy" ? "page" : undefined}><ShieldCheck size={17} /> <span>Privacy</span></Link>
+            <Link to="/assistant" className="nav-assistant" aria-current={location.pathname === "/assistant" ? "page" : undefined}><MessageCircle size={17} /> <span>Assistant</span></Link>
           </nav>
         </div>
       </header>

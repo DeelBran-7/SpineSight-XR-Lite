@@ -48,6 +48,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             yield
         finally:
             try:
+                await app.state.runtime.reports.aclose()
                 await llm.aclose()
             finally:
                 await run_in_threadpool(detector.close)

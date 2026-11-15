@@ -83,6 +83,8 @@ def upstream(monkeypatch):
         assert request.headers["Authorization"] == f"Bearer {_API_KEY}"
         calls.append(json.loads(request.content))
         next_outcome = outcomes.pop(0)
+        if callable(next_outcome):
+            next_outcome = await next_outcome()
         if isinstance(next_outcome, Exception):
             raise next_outcome
         if isinstance(next_outcome, httpx.Response):
@@ -164,6 +166,8 @@ def test_assistant_uses_separate_prompt_and_bounds_untrusted_history(upstream):
 @pytest.mark.parametrize("unfounded_reply", [
     "Your shoulder angle is 30 degrees.",
     "Your left shoulder appears higher.",
+    "Your shoulders show asymmetry.",
+    "You lean left.",
 ])
 def test_assistant_without_analysis_can_only_use_general_context(upstream, unfounded_reply):
     calls, outcomes = upstream
@@ -229,7 +233,13 @@ def test_bad_json_gets_one_clean_format_repair(upstream):
     [
         "Your left shoulder offset is 42%.",
         "Your shoulder offset is 4.76%.",
+        "Your shoulder angle is 6.45 degrees.",
+        "Your shoulder relative offset is 3.69%.",
         "This confirms scoliosis.",
+        "You do not have scoliosis.",
+        "Do not worry, you have scoliosis.",
+        "The right shoulder is higher.",
+        "The left shoulder landmark is lower.",
         "Your posture appears abnormal.",
         "You should do side planks.",
         123,
@@ -241,6 +251,15 @@ def test_validation_rejects_unsafe_or_wrong_report_fields(upstream, bad_finding)
     malformed["findings"]["shoulder"] = bad_finding
     outcomes.extend([json.dumps(malformed), json.dumps(_REPORT)])
 
+    assert _run("generate_report", _ANALYSIS) == _REPORT
+    assert len(calls) == 2
+
+
+def test_report_rejects_a_torso_direction_contradicting_backend_observation(upstream):
+    calls, outcomes = upstream
+    malformed = deepcopy(_REPORT)
+    malformed["findings"]["torso"] = "The torso leans toward screen right."
+    outcomes.extend([json.dumps(malformed), json.dumps(_REPORT)])
     assert _run("generate_report", _ANALYSIS) == _REPORT
     assert len(calls) == 2
 
@@ -263,4 +282,111 @@ def test_upstream_error_is_safe_and_not_retried(upstream, upstream_failure):
     assert raised.value.status_code == 502
     assert _API_KEY not in str(raised.value)
     assert "Mock" not in raised.value.message
+    assert len(calls) == 1
+
+
+def test_concurrency_limit_rejects_before_spending_more_tokens(upstream):
+    calls, outcomes = upstream
+
+    async def run():
+        release, started = asyncio.Event(), asyncio.Event()
+
+        async def delayed():
+            if len(calls) == 2:
+                started.set()
+            await release.wait()
+            return json.dumps({"reply": "Keep your hips visible."})
+
+        outcomes.extend([delayed, delayed])
+        service = LLMService(_API_KEY, _BASE_URL, _MODEL, timeout_seconds=1)
+        try:
+            pending = [asyncio.create_task(service.assistant_reply(None, "Capture?", [])) for _ in range(2)]
+            await started.wait()
+            with pytest.raises(LLMError) as caught:
+                await service.assistant_reply(None, "One more?", [])
+            assert caught.value.code == "AI_BUSY"
+            assert caught.value.status_code == 429
+            assert len(calls) == 2
+            release.set()
+            await asyncio.gather(*pending)
+        finally:
+            release.set()
+            await service.aclose()
+
+    asyncio.run(run())
+
+
+def test_rate_limit_recovers_and_repair_counts_as_one_user_request(upstream, monkeypatch):
+    calls, outcomes = upstream
+    monkeypatch.setattr(llm_service, "_MAX_REQUESTS_PER_MINUTE", 1)
+    now = 100.0
+    monkeypatch.setattr(llm_service, "monotonic", lambda: now)
+    outcomes.extend(["bad json", json.dumps(_REPORT), json.dumps(_REPORT)])
+
+    async def run():
+        nonlocal now
+        service = LLMService(_API_KEY, _BASE_URL, _MODEL)
+        try:
+            assert await service.generate_report(_ANALYSIS) == _REPORT
+            with pytest.raises(LLMError) as caught:
+                await service.generate_report(_ANALYSIS)
+            assert caught.value.code == "AI_RATE_LIMITED"
+            assert len(calls) == 2
+            now += 60
+            assert await service.generate_report(_ANALYSIS) == _REPORT
+            assert len(calls) == 3
+        finally:
+            await service.aclose()
+
+    asyncio.run(run())
+
+
+def test_repair_shares_total_timeout_budget(upstream):
+    calls, outcomes = upstream
+
+    async def malformed():
+        await asyncio.sleep(0.02)
+        return "bad json"
+
+    async def slow():
+        await asyncio.sleep(1)
+        return json.dumps(_REPORT)
+
+    outcomes.extend([malformed, slow])
+
+    async def run():
+        service = LLMService(_API_KEY, _BASE_URL, _MODEL, timeout_seconds=0.05)
+        try:
+            with pytest.raises(LLMError) as caught:
+                await service.generate_report(_ANALYSIS)
+            assert caught.value.code == "REPORT_GENERATION_FAILED"
+            assert len(calls) == 2
+            assert service._slots._value == 2
+        finally:
+            await service.aclose()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("finish_reason", ["length", "content_filter"])
+def test_incomplete_or_refused_output_does_not_spend_a_repair_request(upstream, finish_reason):
+    calls, outcomes = upstream
+    completion = _completion(json.dumps(_REPORT))
+    completion["choices"][0]["finish_reason"] = finish_reason
+    outcomes.append(httpx.Response(200, json=completion))
+
+    with pytest.raises(LLMError):
+        _run("generate_report", _ANALYSIS)
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("reply", [
+    "This cannot diagnose or rule out scoliosis.",
+    "The app cannot determine whether you have scoliosis.",
+    "Do not perform exercises based on these measurements.",
+])
+def test_medical_limitations_are_not_mistaken_for_medical_advice(upstream, reply):
+    calls, outcomes = upstream
+    outcomes.append(json.dumps({"reply": reply}))
+    assert _run("assistant_reply", _ANALYSIS, "Can this diagnose me?", []) == reply
     assert len(calls) == 1

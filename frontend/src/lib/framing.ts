@@ -40,17 +40,25 @@ export function evaluateFraming(points: PosePoint[]): Guidance {
   if (center < MIN_CENTER || center > MAX_CENTER) return "center";
 
   const head = HEAD_INDICES.map((index) => points[index]).filter(visible);
-  if (!head.length) return "low_visibility";
   const framePoints = [...core, ...head];
   const highest = Math.min(...framePoints.map(({ y }) => y));
   const lowest = Math.max(...framePoints.map(({ y }) => y));
   const clipped = framePoints.some(({ x, y }) => x < FRAME_MARGIN || x > 1 - FRAME_MARGIN
     || y < FRAME_MARGIN || y > 1 - FRAME_MARGIN);
-  if (clipped || lowest - highest > MAX_BODY_SCALE) return "farther";
-  if (lowest - highest < MIN_BODY_SCALE) return "closer";
+  const minScale = head.length ? MIN_BODY_SCALE : 0.22;
+  const maxScale = head.length ? MAX_BODY_SCALE : 0.65;
+  if (clipped || lowest - highest > maxScale) return "farther";
+  if (lowest - highest < minScale) return "closer";
   return "ready";
 }
 
 export function mayCapture(guidanceState: Guidance, capturedAt: number, now: number) {
-  return guidanceState === "ready" && now - capturedAt <= FRAME_MAX_AGE_MS;
+  const age = now - capturedAt;
+  return guidanceState === "ready" && Number.isFinite(age) && age >= 0 && age <= FRAME_MAX_AGE_MS;
+}
+
+// Preserve the camera's aspect ratio; guidance need not copy a full sensor frame.
+export function frameSize(width: number, height: number, capturing: boolean) {
+  const scale = Math.min(1, (capturing ? 1600 : 768) / Math.max(width, height));
+  return { width: Math.max(1, Math.round(width * scale)), height: Math.max(1, Math.round(height * scale)) };
 }

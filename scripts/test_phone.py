@@ -3,11 +3,12 @@ from contextlib import contextmanager
 from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+import socket
 from tempfile import TemporaryDirectory
-from threading import Thread
+from threading import Event, Thread
 from unittest import TestCase
 
-from scripts.phone import MAX_BODY, MAX_RESPONSE_BODY, make_handler
+from scripts.phone import BoundedThreadingHTTPServer, MAX_BODY, MAX_RESPONSE_BODY, make_handler
 
 
 @contextmanager
@@ -50,6 +51,12 @@ class PhoneGatewayTests(TestCase):
         directory = Path(self.enterContext(TemporaryDirectory()))
         (directory / "index.html").write_bytes(b"<!doctype html><title>Demo</title>")
         (directory / "app.js").write_bytes(b"console.log('demo');")
+        (directory / "models").mkdir()
+        (directory / "models/pose.task").write_bytes(b"model-test-fixture")
+        (directory / "wasm").mkdir()
+        (directory / "wasm/vision.wasm").write_bytes(b"wasm-test-fixture")
+        (directory / "assets").mkdir()
+        (directory / "assets/index-abc12345.js").write_bytes(b"hashed-test-fixture")
         self.port = self.enterContext(serve(make_handler(directory, "test-password", backend_port=backend_port)))
         self.authorization = "Basic " + base64.b64encode(b"observer:test-password").decode()
 
@@ -123,3 +130,70 @@ class PhoneGatewayTests(TestCase):
     def test_oversized_upstream_response_does_not_return_truncated_success(self):
         status, _, _ = self.request("/api/large-response")
         self.assertEqual(status, 502)
+
+    def test_cross_origin_posts_cannot_use_cached_basic_credentials(self):
+        for headers in (
+            {"Origin": "https://evil.example"},
+            {"Origin": "null"},
+            {"Sec-Fetch-Site": "cross-site"},
+            {"Sec-Fetch-Site": "same-site"},
+            {"Host": "demo.example", "Origin": "http://demo.example"},
+            {"Host": "demo.example", "Origin": "https://observer@demo.example"},
+        ):
+            with self.subTest(headers=headers):
+                self.assertEqual(self.request("/api/v1/report", method="POST", headers=headers, body=b"{}")[0], 403)
+        self.assertEqual(self.calls, [])
+        status, headers, _ = self.request(
+            "/api/v1/report", method="POST", body=b"{}",
+            headers={"Host": "demo.example", "Origin": "https://demo.example", "Sec-Fetch-Site": "same-origin"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["X-Frame-Options"], "DENY")
+        self.assertIn("frame-ancestors 'none'", headers["Content-Security-Policy"])
+        self.assertEqual(len(self.calls), 1)
+
+    def test_only_versioned_static_assets_get_private_cache_headers(self):
+        cacheable = ["/models/pose.task?v=" + "a" * 64, "/wasm/vision.wasm?v=1.2.3", "/assets/index-abc12345.js"]
+        for path in cacheable:
+            with self.subTest(path=path):
+                status, headers, _ = self.request(path)
+                self.assertEqual(status, 200)
+                self.assertEqual(headers["Cache-Control"], "private, max-age=3600")
+                status, headers, _ = self.request(path, authorized=False)
+                self.assertEqual(status, 401)
+                self.assertEqual(headers["Cache-Control"], "no-store")
+        for path in ("/", "/api/health", "/models/pose.task", "/wasm/vision.wasm", "/app.js?v=1.2.3"):
+            with self.subTest(path=path):
+                self.assertEqual(self.request(path)[1]["Cache-Control"], "no-store")
+
+    def test_connection_capacity_is_bounded_and_recovers(self):
+        started, release = Event(), Event()
+
+        class SlowHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                started.set()
+                release.wait(timeout=2)
+                self.send_response(204)
+                self.end_headers()
+
+            def log_message(self, *_args):
+                pass
+
+        with BoundedThreadingHTTPServer(("127.0.0.1", 0), SlowHandler, max_connections=1) as server:
+            worker = Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+            worker.start()
+            first = socket.create_connection(server.server_address, timeout=2)
+            try:
+                first.sendall(b"GET / HTTP/1.0\r\n\r\n")
+                self.assertTrue(started.wait(timeout=1))
+                connection = HTTPConnection(*server.server_address, timeout=2)
+                connection.request("GET", "/")
+                self.assertEqual(connection.getresponse().status, 503)
+                connection.close()
+                release.set()
+                self.assertIn(b"204", first.recv(1024))
+            finally:
+                release.set()
+                first.close()
+                server.shutdown()
+                worker.join()

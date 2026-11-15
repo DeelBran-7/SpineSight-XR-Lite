@@ -3,6 +3,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 type CameraState =
   | { status: "loading" }
   | { status: "ready" }
+  | { status: "paused" }
   | { status: "error"; message: string };
 
 export function cameraErrorMessage(error: unknown) {
@@ -29,10 +30,12 @@ export function stopTracks(stream: MediaStream | null) {
 export function useCamera() {
   const video = useRef<HTMLVideoElement>(null);
   const stream = useRef<MediaStream | null>(null);
+  const generation = useRef(0);
   const [state, setState] = useState<CameraState>({ status: "loading" });
   const [attempt, setAttempt] = useState(0);
 
   const stop = useCallback(() => {
+    generation.current += 1;
     stopTracks(stream.current);
     stream.current = null;
     if (video.current) video.current.srcObject = null;
@@ -47,7 +50,9 @@ export function useCamera() {
     const element = video.current;
     let disposed = false;
     async function start() {
-      if (disposed || !element) return;
+      if (disposed || !element || document.visibilityState === "hidden") return;
+      const request = ++generation.current;
+      setState({ status: "loading" });
       if (!navigator.mediaDevices?.getUserMedia) {
         setState({ status: "error", message: window.isSecureContext
           ? "This browser does not provide camera access. You can choose an existing photo."
@@ -60,24 +65,41 @@ export function useCamera() {
           audio: false,
           video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 1440 } },
         });
-        if (disposed) {
+        if (disposed || request !== generation.current || document.hidden) {
           stopTracks(cameraStream);
           return;
         }
         stream.current = cameraStream;
+        cameraStream.getVideoTracks().forEach((track) => track.addEventListener("ended", () => {
+          if (!disposed && stream.current === cameraStream) {
+            stop();
+            setState({ status: "error", message: "The camera was disconnected. Reconnect it and try again." });
+          }
+        }, { once: true }));
         element.srcObject = cameraStream;
         await element.play();
-        if (!disposed) setState({ status: "ready" });
+        if (!disposed && request === generation.current) setState({ status: "ready" });
       } catch (error) {
-        if (!disposed) {
+        if (!disposed && request === generation.current) {
           stop();
           setState({ status: "error", message: cameraErrorMessage(error) });
         }
       }
     }
-    void Promise.resolve().then(start);
+    function visibilityChanged() {
+      if (document.visibilityState === "hidden") {
+        stop();
+        setState({ status: "paused" });
+      } else {
+        void start();
+      }
+    }
+    document.addEventListener("visibilitychange", visibilityChanged);
+    if (document.visibilityState === "hidden") setState({ status: "paused" });
+    else void Promise.resolve().then(start);
     return () => {
       disposed = true;
+      document.removeEventListener("visibilitychange", visibilityChanged);
       stop();
       if (element) element.srcObject = null;
     };

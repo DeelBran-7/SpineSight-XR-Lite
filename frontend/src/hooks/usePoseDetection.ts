@@ -1,12 +1,15 @@
 import { useCallback, useEffect, useRef, useState, type RefObject } from "react";
 import type { PoseLandmarker } from "@mediapipe/tasks-vision";
-import { FRAME_INTERVAL_MS, FRAME_MAX_AGE_MS } from "@/lib/framing";
+import { FRAME_INTERVAL_MS, FRAME_MAX_AGE_MS, frameSize } from "@/lib/framing";
 import type { PoseFrame, WorkerRequest, WorkerResponse } from "@/lib/vision";
 
 type PoseState =
   | { status: "loading" }
   | { status: "running" }
   | { status: "error"; message: string };
+
+const INFERENCE_TIMEOUT_MS = 3000;
+const INITIALIZE_TIMEOUT_MS = 20000;
 
 function canvasPhoto(canvas: HTMLCanvasElement) {
   return new Promise<Blob | undefined>((resolve) => {
@@ -27,142 +30,179 @@ export function usePoseDetection(video: RefObject<HTMLVideoElement | null>, enab
     return request;
   }, []);
   const cancelCapture = useCallback(() => { queuedCapture.current = null; }, []);
-  const retry = useCallback(() => {
-    setState({ status: "loading" });
-    setFrame(null);
-    setAttempt((current) => current + 1);
-  }, []);
+  const retry = useCallback(() => setAttempt((current) => current + 1), []);
 
   useEffect(() => {
-    if (!enabled) return;
+    if (!enabled || !video.current) return;
     const element = video.current;
-    if (!element) return;
     let active = true;
+    let failed = false;
     let busy = false;
     let worker: Worker | null = null;
     let model: PoseLandmarker | null = null;
+    let detect: typeof import("@/lib/vision").detectPose | null = null;
     let sampleCanvas: HTMLCanvasElement | null = null;
     let sampleContext: CanvasRenderingContext2D | null = null;
     let animation = 0;
-    let workerTimeout = 0;
+    let watchdog = 0;
     let lastTime = -Infinity;
     let lastVideoTime = -1;
     let lastPublished = -Infinity;
+    let deliveredFrame = 0;
+    let deliveredAt = performance.now();
+    let sampledFrame = -1;
+    let videoCallback = 0;
+    const receivesVideoFrames = typeof element.requestVideoFrameCallback === "function";
+    function videoFrame(now: number) {
+      if (!active || failed) return;
+      deliveredFrame += 1;
+      deliveredAt = now;
+      videoCallback = element.requestVideoFrameCallback(videoFrame);
+    }
+    if (receivesVideoFrames) videoCallback = element.requestVideoFrameCallback(videoFrame);
     let usingFallback = false;
-
-    function publish(result: PoseFrame) {
-      if (!active) return;
-      busy = false;
-      lastPublished = result.sampledAt;
-      setFrame(result);
-    }
-
-    function fail(message: string) {
-      if (!active) return;
-      busy = false;
-      queuedCapture.current = null;
-      cancelAnimationFrame(animation);
-      setFrame(null);
-      setState({ status: "error", message });
-    }
+    const initialization = new AbortController();
+    setState({ status: "loading" });
+    setFrame(null);
 
     function terminateWorker() {
-      clearTimeout(workerTimeout);
       worker?.terminate();
       worker = null;
     }
 
-    async function beginFallback() {
-      if (usingFallback || !active) return;
-      usingFallback = true;
+    function publish(result: PoseFrame) {
+      if (!active || failed) return;
+      clearTimeout(watchdog);
+      busy = false;
+      lastPublished = result.sampledAt;
+      // Inference and JPEG encoding can complete after the person has moved.
+      if (performance.now() - result.sampledAt > FRAME_MAX_AGE_MS) {
+        setFrame(result.captureRequest === null ? null : { ...result, status: "waiting", photo: undefined });
+      } else {
+        setFrame(result);
+      }
+    }
+
+    function fail(message: string) {
+      if (!active || failed) return;
+      failed = true;
+      queuedCapture.current = null;
+      clearTimeout(watchdog);
+      cancelAnimationFrame(animation);
+      if (receivesVideoFrames) element.cancelVideoFrameCallback(videoCallback);
+      initialization.abort();
       terminateWorker();
+      model?.close();
+      model = null;
+      setFrame(null);
+      setState({ status: "error", message });
+    }
+
+    async function beginFallback() {
+      if (usingFallback || !active || failed) return;
+      usingFallback = true;
+      clearTimeout(watchdog);
+      cancelAnimationFrame(animation);
+      terminateWorker();
+      setFrame(null);
+      setState({ status: "loading" });
+      watchdog = window.setTimeout(() => fail("Live framing guidance took too long to start. Retry guidance or choose an existing photo."), INITIALIZE_TIMEOUT_MS);
       try {
-        const { createPoseLandmarker } = await import("@/lib/vision");
-        const localModel = await createPoseLandmarker(window.location.href, false);
-        if (!active) {
+        const vision = await import("@/lib/vision");
+        if (!active || failed) return;
+        const localModel = await vision.createPoseLandmarker(window.location.href, false, initialization.signal);
+        if (!active || failed) {
           localModel.close();
           return;
         }
+        clearTimeout(watchdog);
         model = localModel;
+        detect = vision.detectPose;
         sampleCanvas = document.createElement("canvas");
         sampleContext = sampleCanvas.getContext("2d", { alpha: false });
         if (!sampleContext) throw new Error("Frame canvas unavailable.");
         busy = false;
+        lastVideoTime = -1;
         setState({ status: "running" });
-        cancelAnimationFrame(animation);
         animation = requestAnimationFrame(tick);
       } catch {
         fail("Live framing guidance could not start. Try again or choose an existing photo.");
       }
     }
 
-    async function sample(source: HTMLVideoElement, time: number, capture: number | null) {
+    async function sample(time: number, capture: number | null) {
+      const target = worker;
+      watchdog = window.setTimeout(() => {
+        if (target) void beginFallback();
+        else fail("Live framing guidance stopped responding. Retry guidance or choose an existing photo.");
+      }, INFERENCE_TIMEOUT_MS);
       try {
-        if (worker) {
-          const bitmap = await createImageBitmap(source);
-          if (!active || !worker) {
+        const size = frameSize(element.videoWidth, element.videoHeight, capture !== null);
+        if (target) {
+          const bitmap = await createImageBitmap(element, { resizeWidth: size.width, resizeHeight: size.height });
+          if (!active || failed || target !== worker) {
             bitmap.close();
             return;
           }
           const message: WorkerRequest = { type: "frame", image: bitmap, sampledAt: time, capture };
-          worker.postMessage(message, [bitmap]);
-        } else if (model && sampleCanvas && sampleContext) {
-          const { detectPose } = await import("@/lib/vision");
-          if (!active || !model) return;
-          sampleCanvas.width = source.videoWidth;
-          sampleCanvas.height = source.videoHeight;
-          sampleContext.drawImage(source, 0, 0);
-          const result = detectPose(model, sampleCanvas, time, capture);
-          if (capture && result.status === "ready") result.photo = await canvasPhoto(sampleCanvas);
+          try {
+            target.postMessage(message, [bitmap]);
+          } catch (error) {
+            bitmap.close();
+            throw error;
+          }
+        } else if (model && detect && sampleCanvas && sampleContext) {
+          if (sampleCanvas.width !== size.width) sampleCanvas.width = size.width;
+          if (sampleCanvas.height !== size.height) sampleCanvas.height = size.height;
+          sampleContext.drawImage(element, 0, 0, size.width, size.height);
+          const result = detect(model, sampleCanvas, time, capture);
+          if (capture !== null && result.status === "ready") result.photo = await canvasPhoto(sampleCanvas);
           publish(result);
         }
       } catch {
-        if (worker) {
-          busy = true;
-          await beginFallback();
-        } else {
-          fail("Live framing guidance stopped. Try again or choose an existing photo.");
-        }
+        if (target && target === worker) await beginFallback();
+        else if (!target) fail("Live framing guidance stopped. Try again or choose an existing photo.");
       }
     }
 
     function tick(now: number) {
-      if (!active || !element) return;
+      if (!active || failed) return;
       animation = requestAnimationFrame(tick);
       if (now - lastPublished > FRAME_MAX_AGE_MS && lastPublished !== -Infinity) {
         lastPublished = -Infinity;
-        setFrame((current) => current?.photo ? current : null);
+        setFrame(null);
       }
-      if (busy || now - lastTime < FRAME_INTERVAL_MS || element.readyState < 2
-        || !element.videoWidth || element.currentTime === lastVideoTime) return;
+      if (busy || document.visibilityState === "hidden" || now - lastTime < FRAME_INTERVAL_MS || element.readyState < 2
+        || !element.videoWidth || (receivesVideoFrames && now - deliveredAt > FRAME_MAX_AGE_MS)
+        || (receivesVideoFrames ? deliveredFrame === sampledFrame : element.currentTime === lastVideoTime)) return;
       busy = true;
       lastTime = now;
       lastVideoTime = element.currentTime;
+      sampledFrame = deliveredFrame;
       const capture = queuedCapture.current;
       queuedCapture.current = null;
-      void sample(element, now, capture);
+      void sample(receivesVideoFrames ? deliveredAt : now, capture);
     }
 
     if (typeof Worker !== "undefined" && typeof OffscreenCanvas !== "undefined"
       && typeof createImageBitmap === "function") {
       try {
-        worker = new Worker(new URL("../lib/vision.worker.ts", import.meta.url), { type: "module" });
-        worker.onmessage = ({ data }: MessageEvent<WorkerResponse>) => {
-          if (!active) return;
+        const instance = new Worker(new URL("../lib/vision.worker.ts", import.meta.url), { type: "module" });
+        worker = instance;
+        instance.onmessage = ({ data }: MessageEvent<WorkerResponse>) => {
+          if (!active || failed || worker !== instance) return;
           if (data.type === "ready") {
-            clearTimeout(workerTimeout);
+            clearTimeout(watchdog);
             setState({ status: "running" });
             animation = requestAnimationFrame(tick);
-          } else if (data.type === "frame") {
-            publish(data.frame);
-          } else {
-            void beginFallback();
-          }
+          } else if (data.type === "frame") publish(data.frame);
+          else void beginFallback();
         };
-        worker.onerror = () => { void beginFallback(); };
+        instance.onerror = () => { if (worker === instance) void beginFallback(); };
+        instance.onmessageerror = () => { if (worker === instance) void beginFallback(); };
         const message: WorkerRequest = { type: "initialize", rootUrl: window.location.href };
-        worker.postMessage(message);
-        workerTimeout = window.setTimeout(() => { void beginFallback(); }, 20000);
+        instance.postMessage(message);
+        watchdog = window.setTimeout(() => { void beginFallback(); }, INITIALIZE_TIMEOUT_MS);
       } catch {
         void beginFallback();
       }
@@ -173,10 +213,14 @@ export function usePoseDetection(video: RefObject<HTMLVideoElement | null>, enab
     return () => {
       active = false;
       queuedCapture.current = null;
+      clearTimeout(watchdog);
       cancelAnimationFrame(animation);
+      if (receivesVideoFrames) element.cancelVideoFrameCallback(videoCallback);
+      initialization.abort();
       terminateWorker();
       model?.close();
       model = null;
+      if (sampleCanvas) sampleCanvas.width = sampleCanvas.height = 0;
     };
   }, [attempt, enabled, video]);
 

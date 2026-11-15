@@ -26,16 +26,24 @@ export type WorkerResponse = { type: "ready" }
   | { type: "frame"; frame: PoseFrame }
   | { type: "error"; stage: "initialize" | "infer" };
 
-export async function createPoseLandmarker(rootUrl: string, inWorker: boolean) {
+export async function createPoseLandmarker(rootUrl: string, inWorker: boolean, signal?: AbortSignal) {
   const base = new URL(import.meta.env.BASE_URL, rootUrl);
   const wasm = new URL("wasm", base).href;
-  const model = new URL("models/pose_landmarker_lite.task", base).href;
-  const response = await fetch(model, { cache: "no-store" });
+  const model = new URL("models/pose_landmarker_lite.task", base);
+  model.searchParams.set("v", "59929e1d1ee95287735ddd833b19cf4ac46d29bc7afddbbf6753c459690d574a");
+  const response = await fetch(model.href, { signal });
   if (!response.ok || response.headers.get("content-type")?.includes("text/html")) {
     throw new Error("Pose Landmarker Lite model is unavailable.");
   }
   const modelAssetBuffer = new Uint8Array(await response.arrayBuffer());
   const files = await FilesetResolver.forVisionTasks(wasm, inWorker);
+  for (const key of ["wasmLoaderPath", "wasmBinaryPath", "assetLoaderPath", "assetBinaryPath"] as const) {
+    if (files[key]) {
+      const asset = new URL(files[key]);
+      asset.searchParams.set("v", "1.2.3");
+      files[key] = asset.href;
+    }
+  }
   return PoseLandmarker.createFromOptions(files, {
     baseOptions: { modelAssetBuffer, delegate: "CPU" },
     runningMode: "VIDEO",

@@ -23,14 +23,14 @@ import { checkPhoto } from "@/lib/photo";
 import { useSession } from "@/lib/session";
 import { cn } from "@/lib/utils";
 
-const TIMERS = [0, 3, 5] as const;
+const TIMERS = [0, 3, 5, 10] as const;
 
 export function CapturePage() {
   const navigate = useNavigate();
   const { setPhoto, id } = useSession();
   const { video, state: camera, stop, retry: retryCamera } = useCamera();
   const { state: pose, frame, requestCapture, cancelCapture, retry: retryPose } = usePoseDetection(video, camera.status === "ready");
-  const [delay, setDelay] = useState<(typeof TIMERS)[number]>(0);
+  const [delay, setDelay] = useState<(typeof TIMERS)[number]>(10);
   const [countdown, setCountdown] = useState<number | null>(null);
   const [snapping, setSnapping] = useState(false);
   const [checkingFile, setCheckingFile] = useState(false);
@@ -40,7 +40,9 @@ export function CapturePage() {
   const active = useRef(false);
   const countdownEnd = useRef<number | null>(null);
   const status = frame?.status ?? "waiting";
-  const voice = useVoiceGuidance(status);
+  const timerSpeech = countdown === null ? (snapping ? "Hold still." : undefined)
+    : countdown <= 3 ? `${countdown}` : "Timer started. Step into frame with your back toward the camera.";
+  const voice = useVoiceGuidance(status, timerSpeech);
   const cameraRunning = camera.status === "ready";
   const guideRunning = cameraRunning && pose.status === "running";
   const ready = guideRunning && status === "ready";
@@ -56,12 +58,12 @@ export function CapturePage() {
   }
 
   function snap() {
-    if (!canSnap || !frame || !mayCapture(frame.status, frame.sampledAt, performance.now())) return;
+    if (capturePending.current !== null || !canSnap || !frame || !mayCapture(frame.status, frame.sampledAt, performance.now())) return;
     takeOnNextFrame();
   }
 
   function armTimer() {
-    if (!delay || !guideRunning || snapping || checkingFile || countdown !== null) return;
+    if (!delay || !guideRunning || capturePending.current !== null || snapping || checkingFile || countdown !== null) return;
     setError("");
     countdownEnd.current = performance.now() + delay * 1000;
     setCountdown(delay);
@@ -81,10 +83,26 @@ export function CapturePage() {
   }, []);
 
   useEffect(() => {
+    const interrupt = () => {
+      if (document.visibilityState !== "hidden" && guideRunning) return;
+      const interrupted = countdownEnd.current !== null || capturePending.current !== null;
+      countdownEnd.current = null;
+      capturePending.current = null;
+      cancelCapture();
+      setCountdown(null);
+      setSnapping(false);
+      if (interrupted) setError("Capture was paused. Start the timer again when the camera is ready.");
+    };
+    interrupt();
+    document.addEventListener("visibilitychange", interrupt);
+    return () => document.removeEventListener("visibilitychange", interrupt);
+  }, [cancelCapture, guideRunning]);
+
+  useEffect(() => {
     if (countdown === null || !guideRunning) return;
     const timer = window.setInterval(() => {
       const end = countdownEnd.current;
-      if (end === null) return;
+      if (end === null || document.visibilityState === "hidden") return;
       const remaining = Math.ceil((end - performance.now()) / 1000);
       if (remaining > 0) {
         setCountdown(remaining);
@@ -113,8 +131,10 @@ export function CapturePage() {
     if (frame?.captureRequest == null || frame.captureRequest !== capturePending.current) return;
     capturePending.current = null;
     setSnapping(false);
-    if (!frame.photo) {
-      setError(frame.status === "ready"
+    if (!mayCapture(frame.status, frame.sampledAt, performance.now()) || !frame.photo) {
+      setError(frame.status === "waiting"
+        ? "The camera did not provide a fresh frame. Try taking the photo again."
+        : frame.status === "ready"
         ? "The photo could not be created. Try again."
         : `No photo was taken. ${guidance[frame.status].title}. Try again when the guide shows Ready.`);
       return;
@@ -161,7 +181,7 @@ export function CapturePage() {
           {camera.status !== "ready" && (
             <div className="camera-placeholder">
               {camera.status === "loading" ? <LoaderCircle className="spin" size={30} /> : <CameraOff size={30} />}
-              <strong>{camera.status === "loading" ? "Opening the camera" : "Camera unavailable"}</strong>
+              <strong>{camera.status === "loading" ? "Opening the camera" : camera.status === "paused" ? "Camera paused" : "Camera unavailable"}</strong>
               {camera.status === "loading" && <p>Allow camera access when prompted.</p>}
             </div>
           )}
@@ -219,7 +239,7 @@ export function CapturePage() {
           )}
           <input ref={input} hidden type="file" accept=".jpg,.jpeg,.png,.webp,image/jpeg,image/png,image/webp" onChange={(event) => void choosePhoto(event)} />
           <div className="capture-alternative">
-            <Button variant="quiet" type="button" onClick={() => input.current?.click()} disabled={checkingFile || snapping}>
+            <Button variant="quiet" type="button" onClick={() => { cancelTimer(); input.current?.click(); }} disabled={checkingFile || snapping}>
               {checkingFile ? <LoaderCircle className="spin" size={18} /> : <ImagePlus size={18} />}
               {checkingFile ? "Opening photo…" : "Choose an existing photo"}
             </Button>

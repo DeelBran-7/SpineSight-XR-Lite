@@ -1,3 +1,4 @@
+import asyncio
 from collections.abc import AsyncIterator
 from io import BytesIO
 from pathlib import Path
@@ -187,6 +188,72 @@ async def test_json_body_limit_is_checked_for_chunked_requests(app_client):
 
     response = await client.post(ASSISTANT, content=body(), headers={"Content-Type": "application/json"})
     assert_error(response, 413, "REQUEST_TOO_LARGE")
+
+
+async def test_slow_json_body_has_a_total_read_deadline(app_client, monkeypatch):
+    _, client = app_client
+    monkeypatch.setattr("app.core.json_route.JSON_READ_TIMEOUT_SECONDS", 0.01)
+
+    async def body():
+        yield b'{"message":"'
+        await asyncio.sleep(0.03)
+        yield b'test"}'
+
+    response = await client.post(ASSISTANT, content=body(), headers={"Content-Type": "application/json"})
+    assert_error(response, 408, "REQUEST_TIMEOUT")
+
+
+async def test_slow_photo_upload_times_out_and_releases_capacity(app_client, monkeypatch):
+    app, client = app_client
+    monkeypatch.setattr("app.services.image_input.UPLOAD_TIMEOUT_SECONDS", 0.01)
+
+    async def body():
+        yield b'--sample\r\nContent-Disposition: form-data; name="file"; filename="photo.png"\r\n\r\n'
+        await asyncio.sleep(0.03)
+        yield image_bytes() + b"\r\n--sample--\r\n"
+
+    response = await client.post(ANALYZE, content=body(), headers={"Content-Type": "multipart/form-data; boundary=sample"})
+    assert_error(response, 408, "REQUEST_TIMEOUT")
+    assert app.state.runtime.photo_slots._value == 2
+    assert (await upload(client)).status_code == 200
+
+
+async def test_photo_capacity_wait_is_bounded(app_client, monkeypatch):
+    app, client = app_client
+    monkeypatch.setattr("app.api.analyze.PHOTO_SLOT_WAIT_SECONDS", 0.01)
+    slots = app.state.runtime.photo_slots
+    await slots.acquire()
+    await slots.acquire()
+    try:
+        assert_error(await upload(client), 503, "ANALYSIS_BUSY")
+    finally:
+        slots.release()
+        slots.release()
+    assert (await upload(client)).status_code == 200
+
+
+async def test_duplicate_report_requests_reuse_validated_output(app_client):
+    app, client = app_client
+    data = (await upload(client)).json()
+    calls = 0
+
+    async def generate(analysis):
+        nonlocal calls
+        calls += 1
+        await asyncio.sleep(0.01)
+        return {
+            "simple_summary": "Landmarks are available.", "technical_summary": "Image geometry.",
+            "findings": {"shoulder": "Available.", "hip": "Available.", "torso": "Available."},
+            "limitations": ["Camera placement matters."], "disclaimer": "Not a diagnosis.",
+        }
+
+    app.state.runtime.llm = SimpleNamespace(generate_report=generate)
+    payload = {"analysis_id": data["analysis_id"]}
+    first, second = await asyncio.gather(client.post(REPORT, json=payload), client.post(REPORT, json=payload))
+    assert first.status_code == second.status_code == 200
+    assert first.json() == second.json()
+    assert (await client.post(REPORT, json=payload)).json() == first.json()
+    assert calls == 1
 
 
 async def test_malformed_and_unsupported_images(app_client):
